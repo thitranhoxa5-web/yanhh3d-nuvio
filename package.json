@@ -1,0 +1,13 @@
+{
+  "name": "yanhh3d-nuvio",
+  "version": "1.0.0",
+  "description": "Nuvio local scraper plugin for yanhh3d (donghua vietsub)",
+  "private": true,
+  "scripts": {
+    "build": "node build.js",
+    "test": "node scripts/test.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
