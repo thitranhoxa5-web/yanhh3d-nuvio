@@ -268,7 +268,7 @@ async function handleCatalog(type, id, extra, origin) {
     id: 'yanhh3d:' + it.slug,
     type: 'series',
     name: it.title,
-    poster: it.poster,
+    poster: imgProxy(origin, it.poster),
     posterShape: 'poster',
   }));
   return json({ metas: metas }, 'public, max-age=600');
@@ -298,23 +298,22 @@ async function handleMeta(type, fullId, origin) {
       if (eps.length) break;
     } catch (e) {}
   }
-  // No `title`/`name`: Nuvio already renders "TẬP {episode}" from the number —
-  // adding our own "Tập N" duplicated it into extra lines. thumbnail avoids
-  // black cards.
+  const posterProxied = imgProxy(origin, posterUrl);
   const videos = eps.map((e) => ({
     id: 'yanhh3d:' + slug + ':' + e.token,
+    title: 'Tập ' + (e.ep || e.token.replace('tap-', '')),
     season: 1,
     episode: e.ep || 1,
-    thumbnail: posterUrl,
+    thumbnail: posterProxied,
   }));
 
   const meta = {
     id: 'yanhh3d:' + slug,
     type: 'series',
     name: ld.name || slug,
-    poster: posterUrl,
+    poster: posterProxied,
     posterShape: 'poster',
-    background: posterUrl,
+    background: posterProxied,
     description: desc,
     genres: genres,
     releaseInfo: year,
@@ -412,6 +411,28 @@ async function handleStream(type, fullId, origin) {
 }
 
 // ---------- proxy (strip PNG-polyglot) ----------
+
+// Posters/thumbnails live on yanhh3d, which the user's ISP often blocks — so a
+// direct <img> from the device fails (black cards). Route images through the
+// Worker (reachable) instead. Returns a same-origin URL, or the input if empty.
+function imgProxy(origin, u) {
+  return u ? origin + '/img?url=' + encodeURIComponent(u) : u;
+}
+
+async function proxyImage(imgUrl) {
+  if (!allowedProxyUrl(imgUrl)) return new Response('forbidden', { status: 403, headers: CORS });
+  const r = await fetch(imgUrl, {
+    headers: { 'User-Agent': UA, Referer: SITE + '/' },
+    cf: { cacheEverything: true, cacheTtl: 604800 },
+  });
+  if (!r.ok) return new Response('', { status: r.status, headers: CORS });
+  return new Response(r.body, {
+    headers: Object.assign(
+      { 'Content-Type': r.headers.get('content-type') || 'image/jpeg', 'Cache-Control': 'public, max-age=604800' },
+      CORS
+    ),
+  });
+}
 
 async function proxyPlaylist(playlistUrl, ref, origin) {
   if (!allowedProxyUrl(playlistUrl)) return new Response('forbidden', { status: 403, headers: CORS });
@@ -531,6 +552,9 @@ export default {
       }
       if (path === '/proxy-segment' || path === '/proxy-segment.ts') {
         return proxySegment(url.searchParams.get('url'), url.searchParams.get('ref'), request.headers.get('Range'));
+      }
+      if (path === '/img') {
+        return proxyImage(url.searchParams.get('url'));
       }
 
       // Stremio resources: /catalog/<type>/<id>[/<extra>].json  etc.
