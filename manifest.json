@@ -1,13 +1,19 @@
 {
-  "id": "yanhh3d",
-  "name": "YanHH3D",
-  "description": "Vietsub donghua / phim 3D Trung Quốc từ yanhh3d (phim bộ)",
+  "name": "YanHH3D Repo",
   "version": "1.0.0",
-  "author": "trumliveads",
-  "supportedTypes": ["tv"],
-  "filename": "providers/yanhh3d.js",
-  "enabled": true,
-  "formats": ["m3u8", "mp4"],
-  "contentLanguage": ["vi"],
-  "logo": "https://yanhh3d.pw/storage/settings/August2024/YOoAwtlobLbwKhiFwRZv.png"
+  "scrapers": [
+    {
+      "id": "yanhh3d",
+      "name": "YanHH3D",
+      "description": "Vietsub donghua / phim 3D Trung Quốc từ yanhh3d (phim bộ)",
+      "version": "1.0.0",
+      "author": "trumliveads",
+      "supportedTypes": ["tv"],
+      "filename": "providers/yanhh3d.js",
+      "enabled": true,
+      "formats": ["m3u8", "mp4"],
+      "contentLanguage": ["vi"],
+      "logo": "https://yanhh3d.pw/storage/settings/August2024/YOoAwtlobLbwKhiFwRZv.png"
+    }
+  ]
 }
