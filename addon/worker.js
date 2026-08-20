@@ -298,12 +298,14 @@ async function handleMeta(type, fullId, origin) {
       if (eps.length) break;
     } catch (e) {}
   }
+  // No `title`/`name`: Nuvio already renders "TẬP {episode}" from the number —
+  // adding our own "Tập N" duplicated it into extra lines. thumbnail avoids
+  // black cards.
   const videos = eps.map((e) => ({
     id: 'yanhh3d:' + slug + ':' + e.token,
-    title: 'Tập ' + (e.ep || e.token.replace('tap-', '')),
     season: 1,
     episode: e.ep || 1,
-    thumbnail: posterUrl, // else Nuvio shows black episode cards
+    thumbnail: posterUrl,
   }));
 
   const meta = {
@@ -318,7 +320,7 @@ async function handleMeta(type, fullId, origin) {
     releaseInfo: year,
     videos: videos,
   };
-  return json({ meta: meta }, 'public, max-age=1800');
+  return json({ meta: meta }, 'public, max-age=60');
 }
 
 // Fetch a watch page and return ONE proxied stream per distinct quality
