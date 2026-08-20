@@ -414,29 +414,70 @@ async function proxyPlaylist(playlistUrl, ref, origin) {
   });
 }
 
-// Find where the real MPEG-TS starts (0x47 with 188-byte periodicity) and strip
-// any PNG-polyglot prefix. Returns the sliced buffer.
-function stripPrefix(buf) {
-  const b = new Uint8Array(buf);
-  // Quick path: already clean TS.
-  if (b[0] === 0x47 && b[188] === 0x47 && b[376] === 0x47) return b;
+// Offset of the real MPEG-TS start (0x47 with 188-byte periodicity), or -1.
+function findTsOffset(b) {
+  if (b[0] === 0x47 && b[188] === 0x47 && b[376] === 0x47) return 0;
   const limit = Math.min(b.length - 188 * 4, 4096);
   for (let o = 0; o < limit; o++) {
-    if (b[o] === 0x47 && b[o + 188] === 0x47 && b[o + 376] === 0x47 && b[o + 564] === 0x47) {
-      return b.subarray(o);
-    }
+    if (b[o] === 0x47 && b[o + 188] === 0x47 && b[o + 376] === 0x47 && b[o + 564] === 0x47) return o;
   }
-  return b; // not a polyglot we recognize — pass through
+  return -1;
 }
 
+// Stream the segment through, stripping only the small PNG-polyglot prefix. We
+// buffer just enough head bytes to locate the TS start, then pass everything
+// else through untouched — so the player receives video almost immediately
+// instead of waiting for the whole 4-10 MB segment to land (the old stutter).
 async function proxySegment(segUrl, ref) {
-  const r = await fetch(segUrl, { headers: { 'User-Agent': UA, Referer: ref || SITE + '/' } });
-  if (!r.ok) return new Response('', { status: r.status, headers: CORS });
-  const buf = await r.arrayBuffer();
-  const ts = stripPrefix(buf);
-  return new Response(ts, {
+  const r = await fetch(segUrl, {
+    headers: { 'User-Agent': UA, Referer: ref || SITE + '/' },
+    cf: { cacheEverything: true, cacheTtl: 86400 },
+  });
+  if (!r.ok || !r.body) return new Response('', { status: r.status || 502, headers: CORS });
+
+  const reader = r.body.getReader();
+  let head = new Uint8Array(0);
+  const stream = new ReadableStream({
+    async pull(controller) {
+      if (head === null) {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+        return;
+      }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (head.length) controller.enqueue(head);
+          controller.close();
+          head = null;
+          return;
+        }
+        const merged = new Uint8Array(head.length + value.length);
+        merged.set(head);
+        merged.set(value, head.length);
+        head = merged;
+        const off = findTsOffset(head);
+        if (off >= 0) {
+          controller.enqueue(head.subarray(off));
+          head = null; // switch to pass-through
+          return;
+        }
+        if (head.length > 8192) {
+          controller.enqueue(head);
+          head = null;
+          return;
+        }
+      }
+    },
+    cancel() {
+      reader.cancel();
+    },
+  });
+
+  return new Response(stream, {
     headers: Object.assign(
-      { 'Content-Type': 'video/mp2t', 'Cache-Control': 'public, max-age=3600' },
+      { 'Content-Type': 'video/mp2t', 'Cache-Control': 'public, max-age=86400' },
       CORS
     ),
   });
