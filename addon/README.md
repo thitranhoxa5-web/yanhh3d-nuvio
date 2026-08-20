@@ -4,6 +4,12 @@ Trái với plugin local scraper (`providers/yanhh3d.js`, chỉ trả stream), a
 catalog riêng**: YanHH3D hiện thành mục browse được trong Nuvio/Stremio, dùng thẳng phim +
 tên tiếng Việt của yanhh3d (không cần TMDB).
 
+## ✅ Đã deploy — link add vào Nuvio
+
+```
+https://yanhh3d.yanhh3d-addon.workers.dev/manifest.json
+```
+
 ## Nó làm gì
 
 - **catalog** `series/yanhh3d-series` — list "Mới cập nhật" + tìm kiếm (`search`), phân trang (`skip`).
