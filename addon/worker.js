@@ -171,12 +171,28 @@ function ldJson(html) {
 // ---------- fbcdn extraction (server-side) ----------
 
 function parsePlayerOptions(html) {
-  const re = /name="(LINK\d+)"[^>]*data-src="([^"]+)"/g;
+  // Each server button is a quality: <a name="LINK5" data-src="...">4K</a>
+  const re = /<a[^>]*name="(LINK\d+)"[^>]*data-src="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
   const out = [];
   let m;
-  while ((m = re.exec(html))) out.push({ name: m[1], url: m[2] });
+  while ((m = re.exec(html))) {
+    out.push({ name: m[1], url: m[2], label: m[3].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() });
+  }
   return out;
 }
+
+function normQuality(label) {
+  const l = (label || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+  if (l.includes('2160') || l.includes('4K')) return '4K';
+  if (l.includes('1440') || l.includes('2K')) return '2K';
+  if (l.includes('1080')) return '1080p';
+  if (l.includes('720')) return '720p';
+  if (l.includes('480')) return '480p';
+  if (l.includes('HD')) return 'HD';
+  return label || 'Auto';
+}
+
+const QUALITY_RANK = { '4K': 5, '2K': 4, '1080p': 3, '720p': 2, HD: 1, '480p': 0 };
 
 // Resolve an fbcdn player page to a media-playlist URL. Prefer scheme o1
 // (data-stream-url, no token). Returns url or null.
@@ -282,38 +298,51 @@ async function handleMeta(type, fullId, origin) {
   return json({ meta: meta }, 'public, max-age=1800');
 }
 
-// Fetch a watch page, pull its fbcdn source, wrap it in a proxied playlist URL.
-// Returns a Stremio stream object labeled with `version`, or null.
-async function versionStream(watchUrl, version, slug, epNum, origin) {
+// Fetch a watch page and return ONE proxied stream per distinct quality
+// (each server button on the page is a different quality: 4K / 1080p / HD...).
+async function versionStreams(watchUrl, version, slug, epNum, origin) {
   let html;
   try {
     html = await getText(watchUrl, siteHeaders());
   } catch (e) {
-    return null;
+    return [];
   }
-  if (/404 Not Found/i.test(html.slice(0, 300))) return null;
+  if (/404 Not Found/i.test(html.slice(0, 300))) return [];
+
+  const byQ = {};
   for (const o of parsePlayerOptions(html)) {
     if (!/fbcdn\.cloud/.test(o.url)) continue;
-    const playlist = await resolveFbcdnPlaylist(o.url);
-    if (!playlist) continue;
-    const proxied =
-      origin + '/proxy-playlist.m3u8?url=' + encodeURIComponent(playlist) + '&ref=' + encodeURIComponent(SITE + '/');
-    return {
-      name: 'YanHH3D',
-      title: version + ' • Tập ' + epNum,
-      url: proxied,
-      behaviorHints: { notWebReady: false, bingeGroup: 'yanhh3d-' + slug + '-' + version },
-    };
+    const q = normQuality(o.label);
+    if (!(q in byQ)) byQ[q] = o; // one server per quality is enough
   }
-  return null;
+
+  const entries = Object.keys(byQ).map((q) => ({ q: q, o: byQ[q] }));
+  const resolved = await Promise.all(
+    entries.map(async (e) => {
+      const playlist = await resolveFbcdnPlaylist(e.o.url);
+      if (!playlist) return null;
+      const proxied =
+        origin + '/proxy-playlist.m3u8?url=' + encodeURIComponent(playlist) + '&ref=' + encodeURIComponent(SITE + '/');
+      return {
+        name: 'YanHH3D ' + e.q,
+        title: version + ' • ' + e.q + ' • Tập ' + epNum,
+        url: proxied,
+        quality: e.q,
+        behaviorHints: { notWebReady: false, bingeGroup: 'yanhh3d-' + slug + '-' + version + '-' + e.q },
+      };
+    })
+  );
+  return resolved
+    .filter(Boolean)
+    .sort((a, b) => (QUALITY_RANK[b.quality] || 0) - (QUALITY_RANK[a.quality] || 0));
 }
 
 // Thuyết Minh lives on the default server path. Recent episodes are at
 // /<slug>/tap-N, but older ones are grouped into clusters (tap-88-90), so on a
 // direct miss we look up the cluster token that covers this episode number.
-async function thuyetMinhStream(slug, epNum, epToken, origin) {
-  const direct = await versionStream(SITE + '/' + slug + '/' + epToken, 'Thuyết Minh', slug, epNum, origin);
-  if (direct) return direct;
+async function thuyetMinhStreams(slug, epNum, epToken, origin) {
+  const direct = await versionStreams(SITE + '/' + slug + '/' + epToken, 'Thuyết Minh', slug, epNum, origin);
+  if (direct.length) return direct;
 
   let token = null;
   try {
@@ -325,17 +354,15 @@ async function thuyetMinhStream(slug, epNum, epToken, origin) {
       let m;
       while ((m = re.exec(listHtml))) {
         const nums = m[1].split('-').map(Number);
-        const lo = nums[0];
-        const hi = nums[nums.length - 1];
-        if (epNum >= lo && epNum <= hi) {
+        if (epNum >= nums[0] && epNum <= nums[nums.length - 1]) {
           token = m[1];
           break;
         }
       }
     }
   } catch (e) {}
-  if (!token) return null;
-  return versionStream(SITE + '/' + slug + '/tap-' + token, 'Thuyết Minh', slug, epNum, origin);
+  if (!token) return [];
+  return versionStreams(SITE + '/' + slug + '/tap-' + token, 'Thuyết Minh', slug, epNum, origin);
 }
 
 async function handleStream(type, fullId, origin) {
@@ -352,14 +379,11 @@ async function handleStream(type, fullId, origin) {
   //   /sever2/<slug>/tap-N   -> Vietsub
   // Resolve both so the user can pick.
   const [vs, tm] = await Promise.all([
-    versionStream(SITE + '/sever2/' + slug + '/' + epToken, 'Vietsub', slug, epNum, origin),
-    thuyetMinhStream(slug, epNum, epToken, origin),
+    versionStreams(SITE + '/sever2/' + slug + '/' + epToken, 'Vietsub', slug, epNum, origin),
+    thuyetMinhStreams(slug, epNum, epToken, origin),
   ]);
 
-  const streams = [];
-  if (tm) streams.push(tm);
-  if (vs) streams.push(vs);
-  return json({ streams: streams });
+  return json({ streams: tm.concat(vs) });
 }
 
 // ---------- proxy (strip PNG-polyglot) ----------
