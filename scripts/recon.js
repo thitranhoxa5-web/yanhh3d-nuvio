@@ -84,15 +84,21 @@ function parsePlayerOptions(html) {
   return out;
 }
 
-// The player page carries a base64 JSON blob in `data-obf`.
-function decodeObf(playerHtml) {
-  const m = playerHtml.match(/data-obf="([^"]+)"/);
-  if (!m) return null;
-  try {
-    return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8'));
-  } catch (_) {
-    return null;
+// Two player-page schemes exist on this CDN:
+//   (A) o2/... : <div data-obf="<base64 JSON {sU,pU,eK,hD}>">  -> pU = stream-plain (token, ~min TTL)
+//   (B) o1/... : <div data-stream-url="<m3u8>" data-hash="..."> -> direct m3u8 (no token, ~hour TTL)
+// Returns { scheme, playlistUrl } or null.
+function resolvePlayerPage(playerHtml) {
+  const obfM = playerHtml.match(/data-obf="([^"]+)"/);
+  if (obfM) {
+    try {
+      const o = JSON.parse(Buffer.from(obfM[1], 'base64').toString('utf8'));
+      if (o && o.pU) return { scheme: 'o2/data-obf', playlistUrl: o.pU, extra: o };
+    } catch (_) {}
   }
+  const suM = playerHtml.match(/data-stream-url="([^"]+)"/);
+  if (suM) return { scheme: 'o1/data-stream-url', playlistUrl: suM[1], extra: {} };
+  return null;
 }
 
 // ---- commands --------------------------------------------------------------
@@ -100,7 +106,10 @@ function decodeObf(playerHtml) {
 async function cmdSearch(kw) {
   console.log('# SEARCH:', kw, '\n');
 
-  const ajaxUrl = BASE + '/ajax/search/suggest?keyword=' + encodeURIComponent(kw);
+  // NOTE: param is `keysearch` (NOT `keyword`). `keyword` is silently ignored
+  // and returns a fixed "popular" list -> false matches. `keysearch` filters
+  // correctly and returns empty `data` for no-match.
+  const ajaxUrl = BASE + '/ajax/search/suggest?keysearch=' + encodeURIComponent(kw);
   const a = await get(ajaxUrl, h({ 'X-Requested-With': 'XMLHttpRequest' }));
   console.log('[AJAX suggest]', ajaxUrl);
   console.log('  status', a.status, a.type, a.ms + 'ms');
@@ -149,63 +158,74 @@ async function cmdDetail(slug) {
 }
 
 async function cmdWatch(slug, ep) {
-  const url = BASE + '/' + slug + '/tap-' + ep;
-  console.log('# WATCH:', url, '\n');
+  // IMPORTANT (series): use the /sever2/ path. The default (server 1) path groups
+  // episodes into irregular clusters (tap-88-90, tap-100-110, ...) so /<slug>/tap-<N>
+  // 404s for most N. /sever2/<slug>/tap-<N> is a clean 1:1 mapping 1..lastEp.
+  const url = BASE + '/sever2/' + slug + '/tap-' + ep;
+  console.log('# WATCH (sever2):', url, '\n');
   const w = await get(url);
   console.log('status', w.status, w.type, w.body.length + ' bytes', w.ms + 'ms');
+  if (/404 Not Found/i.test(w.body.slice(0, 200))) {
+    console.log('  -> 404 (episode/slug not on sever2). Try the default path or check slug.');
+    return;
+  }
 
   const allEps = [
-    ...new Set([...w.body.matchAll(/href="[^"]*\/tap-(\d+)"/g)].map((m) => +m[1])),
+    ...new Set([...w.body.matchAll(/\/sever2\/[^"]*\/tap-(\d+)"/g)].map((m) => +m[1])),
   ].sort((a, b) => a - b);
-  console.log('\n[episode list on watch page] count:', allEps.length, 'range:', allEps[0] + '..' + allEps[allEps.length - 1]);
+  console.log('\n[episode list on sever2] count:', allEps.length, 'range:', allEps[0] + '..' + allEps[allEps.length - 1]);
 
   const opts = parsePlayerOptions(w.body);
   console.log('\n[player options] LINK buttons:', opts.length);
   for (const o of opts) console.log('   -', o.name, o.playerUrl);
-
   if (!opts.length) {
-    console.log('\nNo player options found. First 600 bytes of <body>:');
+    console.log('\nNo player options found. First 400 bytes of <body>:');
     const bi = w.body.indexOf('<body');
-    console.log(w.body.slice(bi, bi + 600));
+    console.log(w.body.slice(bi, bi + 400));
     return;
   }
 
-  // Resolve the first option end-to-end.
+  // Resolve the first option end-to-end (handles both o1 and o2 schemes).
   const first = opts[0];
   console.log('\n[resolve]', first.name, '->', first.playerUrl);
   const player = await get(first.playerUrl, h());
   console.log('  player page:', player.status, player.type, player.body.length + ' bytes');
-  const obf = decodeObf(player.body);
-  if (!obf) {
-    console.log('  data-obf: NOT FOUND. First 400 bytes:\n', player.body.slice(0, 400));
+  const r = resolvePlayerPage(player.body);
+  if (!r) {
+    console.log('  UNKNOWN player scheme. First 300 bytes of <body>:');
+    const bi = player.body.indexOf('<body');
+    console.log(player.body.slice(bi, bi + 300));
     return;
   }
-  console.log('  data-obf decoded:');
-  Object.keys(obf).forEach((k) => console.log('     ', k, '=', String(obf[k]).slice(0, 90)));
+  console.log('  scheme:', r.scheme);
+  if (r.extra && r.extra.pU) {
+    Object.keys(r.extra).forEach((k) => console.log('     ', k, '=', String(r.extra[k]).slice(0, 88)));
+  }
+  console.log('  playlistUrl:', r.playlistUrl.slice(0, 110));
 
-  // stream-plain = cleartext HLS media playlist.
-  if (obf.pU) {
-    const plain = await get(obf.pU, h({ Referer: 'https://scontent-sin2-9-xx.fbcdn.cloud/' }));
-    console.log('\n  [stream-plain]', plain.status, plain.type, plain.body.length + ' bytes', plain.ms + 'ms');
-    const segs = [...plain.body.matchAll(/^https?:\/\/\S+/gm)].map((m) => m[0]);
-    console.log('  playlist head:\n' + plain.body.split('\n').slice(0, 8).map((l) => '    ' + l).join('\n'));
-    console.log('  segment count:', segs.length);
-    if (segs.length) {
-      console.log('  first segment:', segs[0]);
-      const seg = await fetch(segs[0], { headers: h() });
-      const buf = Buffer.from(await seg.arrayBuffer());
-      let tsOff = -1;
-      for (let o = 0; o < 2000 && tsOff < 0; o++) {
-        let ok = true;
-        for (let k = 0; k < 20; k++) if (buf[o + k * 188] !== 0x47) { ok = false; break; }
-        if (ok) tsOff = o;
-      }
-      console.log(
-        '  segment:', seg.status, seg.headers.get('content-type'),
-        buf.length + ' bytes; MPEG-TS sync starts at byte', tsOff,
-        '(PNG-polyglot: ' + (tsOff > 0 ? 'YES, ' + tsOff + '-byte prefix' : 'no') + ')'
-      );
+  const plain = await get(r.playlistUrl, h());
+  console.log('\n  [playlist]', plain.status, plain.type, plain.body.length + ' bytes', plain.ms + 'ms');
+  const isMaster = /#EXT-X-STREAM-INF/.test(plain.body);
+  const durs = [...plain.body.matchAll(/#EXTINF:([0-9.]+)/g)].map((m) => +m[1]);
+  const segs = [...plain.body.matchAll(/^https?:\/\/\S+/gm)].map((m) => m[0]);
+  console.log('  type:', isMaster ? 'MASTER (multi-quality)' : 'MEDIA (single -> Auto)',
+    '| segments:', segs.length, '| duration ~' + Math.round(durs.reduce((a, b) => a + b, 0) / 60) + 'm',
+    '| ENDLIST:', /#EXT-X-ENDLIST/.test(plain.body));
+  if (segs.length) {
+    console.log('  first segment:', segs[0].slice(0, 90));
+    const seg = await fetch(segs[0], { headers: h() });
+    const buf = Buffer.from(await seg.arrayBuffer());
+    let tsOff = -1;
+    for (let o = 0; o < 3000 && tsOff < 0; o++) {
+      let ok = true;
+      for (let k = 0; k < 20; k++) if (buf[o + k * 188] !== 0x47) { ok = false; break; }
+      if (ok) tsOff = o;
     }
+    console.log(
+      '  segment:', seg.status, seg.headers.get('content-type'), buf.length + ' bytes;',
+      'MPEG-TS sync @byte', tsOff,
+      tsOff === 0 ? '(clean TS)' : tsOff > 0 ? '(PNG-polyglot: ' + tsOff + '-byte prefix -> ExoPlayer risk!)' : '(no TS found)'
+    );
   }
 }
 
