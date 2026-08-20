@@ -45,6 +45,29 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 };
 
+// Only these hosts may be fetched through the proxy — stops the Worker from
+// being abused as an open proxy (which would burn the free quota). Covers every
+// CDN yanhh3d actually serves video from; unknown hosts are refused.
+const PROXY_HOSTS = [
+  'fbcdn.cloud',
+  'tiktokcdn.com',
+  'defifa.com',
+  'dailymotion.com',
+  'dmcdn.net',
+  'yanhh3d.pw',
+  'yanhh3d.ee',
+  'yanhh3d.work',
+];
+
+function allowedProxyUrl(u) {
+  try {
+    const h = new URL(u).hostname;
+    return PROXY_HOSTS.some((d) => h === d || h.endsWith('.' + d));
+  } catch (e) {
+    return false;
+  }
+}
+
 function json(obj, cache) {
   return new Response(JSON.stringify(obj), {
     headers: Object.assign(
@@ -389,6 +412,7 @@ async function handleStream(type, fullId, origin) {
 // ---------- proxy (strip PNG-polyglot) ----------
 
 async function proxyPlaylist(playlistUrl, ref, origin) {
+  if (!allowedProxyUrl(playlistUrl)) return new Response('forbidden', { status: 403, headers: CORS });
   const text = await getText(playlistUrl, { 'User-Agent': UA, Referer: ref || SITE + '/' });
   const base = playlistUrl;
   const out = text
@@ -429,6 +453,7 @@ function findTsOffset(b) {
 // need the segment size up front to pipeline; a size-less chunked response is
 // what makes playback stutter. (Matches how the K20 add-on serves segments.)
 async function proxySegment(segUrl, ref, rangeHeader) {
+  if (!allowedProxyUrl(segUrl)) return new Response('forbidden', { status: 403, headers: CORS });
   const r = await fetch(segUrl, {
     headers: { 'User-Agent': UA, Referer: ref || SITE + '/' },
     cf: { cacheEverything: true, cacheTtl: 86400 },
