@@ -403,7 +403,7 @@ async function proxyPlaylist(playlistUrl, ref, origin) {
       } catch (e) {
         abs = t;
       }
-      return origin + '/proxy-segment?url=' + encodeURIComponent(abs) + '&ref=' + encodeURIComponent(ref || SITE + '/');
+      return origin + '/proxy-segment.ts?url=' + encodeURIComponent(abs) + '&ref=' + encodeURIComponent(ref || SITE + '/');
     })
     .join('\n');
   return new Response(out, {
@@ -424,62 +424,44 @@ function findTsOffset(b) {
   return -1;
 }
 
-// Stream the segment through, stripping only the small PNG-polyglot prefix. We
-// buffer just enough head bytes to locate the TS start, then pass everything
-// else through untouched — so the player receives video almost immediately
-// instead of waiting for the whole 4-10 MB segment to land (the old stutter).
-async function proxySegment(segUrl, ref) {
+// Strip the PNG-polyglot prefix and serve clean TS. We buffer the segment so we
+// can send Content-Length + Accept-Ranges (and honour Range requests) — players
+// need the segment size up front to pipeline; a size-less chunked response is
+// what makes playback stutter. (Matches how the K20 add-on serves segments.)
+async function proxySegment(segUrl, ref, rangeHeader) {
   const r = await fetch(segUrl, {
     headers: { 'User-Agent': UA, Referer: ref || SITE + '/' },
     cf: { cacheEverything: true, cacheTtl: 86400 },
   });
-  if (!r.ok || !r.body) return new Response('', { status: r.status || 502, headers: CORS });
+  if (!r.ok) return new Response('', { status: r.status, headers: CORS });
 
-  const reader = r.body.getReader();
-  let head = new Uint8Array(0);
-  const stream = new ReadableStream({
-    async pull(controller) {
-      if (head === null) {
-        const { done, value } = await reader.read();
-        if (done) controller.close();
-        else controller.enqueue(value);
-        return;
-      }
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          if (head.length) controller.enqueue(head);
-          controller.close();
-          head = null;
-          return;
-        }
-        const merged = new Uint8Array(head.length + value.length);
-        merged.set(head);
-        merged.set(value, head.length);
-        head = merged;
-        const off = findTsOffset(head);
-        if (off >= 0) {
-          controller.enqueue(head.subarray(off));
-          head = null; // switch to pass-through
-          return;
-        }
-        if (head.length > 8192) {
-          controller.enqueue(head);
-          head = null;
-          return;
-        }
-      }
-    },
-    cancel() {
-      reader.cancel();
-    },
-  });
+  const buf = new Uint8Array(await r.arrayBuffer());
+  const off = findTsOffset(buf);
+  const ts = off > 0 ? buf.subarray(off) : buf;
+  const total = ts.byteLength;
 
-  return new Response(stream, {
-    headers: Object.assign(
-      { 'Content-Type': 'video/mp2t', 'Cache-Control': 'public, max-age=86400' },
-      CORS
-    ),
+  const base = {
+    'Content-Type': 'video/mp2t',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'public, max-age=86400',
+  };
+
+  const m = rangeHeader && /bytes=(\d+)-(\d*)/.exec(rangeHeader);
+  if (m) {
+    const start = parseInt(m[1], 10);
+    const end = m[2] ? Math.min(parseInt(m[2], 10), total - 1) : total - 1;
+    const slice = ts.subarray(start, end + 1);
+    return new Response(slice, {
+      status: 206,
+      headers: Object.assign({}, base, CORS, {
+        'Content-Range': 'bytes ' + start + '-' + end + '/' + total,
+        'Content-Length': String(slice.byteLength),
+      }),
+    });
+  }
+
+  return new Response(ts, {
+    headers: Object.assign({}, base, CORS, { 'Content-Length': String(total) }),
   });
 }
 
@@ -520,8 +502,8 @@ export default {
       if (path === '/proxy-playlist.m3u8') {
         return proxyPlaylist(url.searchParams.get('url'), url.searchParams.get('ref'), origin);
       }
-      if (path === '/proxy-segment') {
-        return proxySegment(url.searchParams.get('url'), url.searchParams.get('ref'));
+      if (path === '/proxy-segment' || path === '/proxy-segment.ts') {
+        return proxySegment(url.searchParams.get('url'), url.searchParams.get('ref'), request.headers.get('Range'));
       }
 
       // Stremio resources: /catalog/<type>/<id>[/<extra>].json  etc.
