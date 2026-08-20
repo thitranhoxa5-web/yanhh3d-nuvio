@@ -1,0 +1,7 @@
+{
+  "name": "yanhh3d-addon",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "YanHH3D Stremio add-on (Cloudflare Worker)"
+}

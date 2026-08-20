@@ -1,0 +1,6 @@
+name = "yanhh3d"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Free plan is enough. Deploy:  cd addon && npx wrangler deploy
+# Resulting URL:  https://yanhh3d.<your-subdomain>.workers.dev/manifest.json
