@@ -196,6 +196,10 @@ async function resolveFbcdnPlaylist(playerUrl) {
       if (j && j.pU) return j.pU;
     } catch (e) {}
   }
+  // Scheme 3 (older Thuyết Minh pages): jwplayer setup with var x = "<...m3u8>".
+  const raw = html.match(/["'](https?:\/\/[^"']+\/stream\/m3u8\/[^"']+\.m3u8)["']/) ||
+    html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/);
+  if (raw) return raw[1];
   return null;
 }
 
@@ -278,6 +282,62 @@ async function handleMeta(type, fullId, origin) {
   return json({ meta: meta }, 'public, max-age=1800');
 }
 
+// Fetch a watch page, pull its fbcdn source, wrap it in a proxied playlist URL.
+// Returns a Stremio stream object labeled with `version`, or null.
+async function versionStream(watchUrl, version, slug, epNum, origin) {
+  let html;
+  try {
+    html = await getText(watchUrl, siteHeaders());
+  } catch (e) {
+    return null;
+  }
+  if (/404 Not Found/i.test(html.slice(0, 300))) return null;
+  for (const o of parsePlayerOptions(html)) {
+    if (!/fbcdn\.cloud/.test(o.url)) continue;
+    const playlist = await resolveFbcdnPlaylist(o.url);
+    if (!playlist) continue;
+    const proxied =
+      origin + '/proxy-playlist.m3u8?url=' + encodeURIComponent(playlist) + '&ref=' + encodeURIComponent(SITE + '/');
+    return {
+      name: 'YanHH3D',
+      title: version + ' • Tập ' + epNum,
+      url: proxied,
+      behaviorHints: { notWebReady: false, bingeGroup: 'yanhh3d-' + slug + '-' + version },
+    };
+  }
+  return null;
+}
+
+// Thuyết Minh lives on the default server path. Recent episodes are at
+// /<slug>/tap-N, but older ones are grouped into clusters (tap-88-90), so on a
+// direct miss we look up the cluster token that covers this episode number.
+async function thuyetMinhStream(slug, epNum, epToken, origin) {
+  const direct = await versionStream(SITE + '/' + slug + '/' + epToken, 'Thuyết Minh', slug, epNum, origin);
+  if (direct) return direct;
+
+  let token = null;
+  try {
+    const detail = await getText(SITE + '/' + slug, siteHeaders());
+    const latest = (detail.match(new RegExp('//[^/"]+/' + escapeRe(slug) + '/tap-([0-9-]+)"')) || [])[1];
+    if (latest) {
+      const listHtml = await getText(SITE + '/' + slug + '/tap-' + latest, siteHeaders());
+      const re = new RegExp('//[^/"]+/' + escapeRe(slug) + '/tap-([0-9-]+)"', 'g');
+      let m;
+      while ((m = re.exec(listHtml))) {
+        const nums = m[1].split('-').map(Number);
+        const lo = nums[0];
+        const hi = nums[nums.length - 1];
+        if (epNum >= lo && epNum <= hi) {
+          token = m[1];
+          break;
+        }
+      }
+    }
+  } catch (e) {}
+  if (!token) return null;
+  return versionStream(SITE + '/' + slug + '/tap-' + token, 'Thuyết Minh', slug, epNum, origin);
+}
+
 async function handleStream(type, fullId, origin) {
   // fullId = yanhh3d:<slug>:tap-<token>
   const rest = fullId.replace(/^yanhh3d:/, '');
@@ -285,62 +345,20 @@ async function handleStream(type, fullId, origin) {
   if (idx < 0) return json({ streams: [] });
   const slug = rest.slice(0, idx);
   const epToken = rest.slice(idx + 1); // e.g. "tap-100"
+  const epNum = parseInt((epToken.match(/\d+/) || ['0'])[0], 10);
 
-  let watch = '';
-  for (const url of [SITE + '/sever2/' + slug + '/' + epToken, SITE + '/' + slug + '/' + epToken]) {
-    try {
-      const html = await getText(url, siteHeaders());
-      if (!/404 Not Found/i.test(html.slice(0, 300))) {
-        watch = html;
-        break;
-      }
-    } catch (e) {}
-  }
-  if (!watch) return json({ streams: [] });
+  // Same episode exists in two versions on two different paths:
+  //   /<slug>/tap-N          -> Thuyết Minh (lồng tiếng)
+  //   /sever2/<slug>/tap-N   -> Vietsub
+  // Resolve both so the user can pick.
+  const [vs, tm] = await Promise.all([
+    versionStream(SITE + '/sever2/' + slug + '/' + epToken, 'Vietsub', slug, epNum, origin),
+    thuyetMinhStream(slug, epNum, epToken, origin),
+  ]);
 
-  const opts = parsePlayerOptions(watch);
   const streams = [];
-
-  // Prefer fbcdn (available on most episodes) via the strip-prefix proxy.
-  for (const o of opts) {
-    if (!/fbcdn\.cloud/.test(o.url)) continue;
-    const playlist = await resolveFbcdnPlaylist(o.url);
-    if (playlist) {
-      const proxied =
-        origin + '/proxy-playlist.m3u8?url=' + encodeURIComponent(playlist) + '&ref=' + encodeURIComponent(SITE + '/');
-      streams.push({
-        name: 'YanHH3D',
-        title: epToken.replace('tap-', 'Tập ') + ' • Vietsub\n🌐 HLS',
-        url: proxied,
-        behaviorHints: { notWebReady: false, bingeGroup: 'yanhh3d-' + slug },
-      });
-      break; // one fbcdn source is enough
-    }
-  }
-
-  // Dailymotion as an extra clean source (no proxy needed).
-  for (const o of opts) {
-    if (!/dailymotion\.com/.test(o.url)) continue;
-    const idM = o.url.match(/video\/([a-zA-Z0-9]+)/);
-    if (!idM) continue;
-    try {
-      const md = await getJson(
-        'https://www.dailymotion.com/player/metadata/video/' + idM[1],
-        { 'User-Agent': UA, Referer: 'https://www.dailymotion.com/' }
-      );
-      const auto = md.qualities && md.qualities.auto && md.qualities.auto[0] && md.qualities.auto[0].url;
-      if (auto) {
-        streams.push({
-          name: 'YanHH3D',
-          title: epToken.replace('tap-', 'Tập ') + ' • Vietsub\n▶ Dailymotion',
-          url: auto,
-          behaviorHints: { notWebReady: false, bingeGroup: 'yanhh3d-' + slug },
-        });
-      }
-    } catch (e) {}
-    break;
-  }
-
+  if (tm) streams.push(tm);
+  if (vs) streams.push(vs);
   return json({ streams: streams });
 }
 
