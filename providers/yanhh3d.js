@@ -1,4 +1,4 @@
-/* yanhh3d Nuvio scraper v1.0.0 — built 2026-08-20T14:49:11.714Z — do not edit by hand (source in src/) */
+/* yanhh3d Nuvio scraper v1.0.0 — built 2026-08-20T14:58:31.732Z — do not edit by hand (source in src/) */
 "use strict";
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
@@ -332,15 +332,274 @@ var require_search = __commonJS({
   }
 });
 
+// src/yanhh3d/detail.js
+var require_detail = __commonJS({
+  "src/yanhh3d/detail.js"(exports2, module2) {
+    "use strict";
+    var C = require_constants();
+    var cache = require_cache();
+    var { getText, siteHeaders, SITE } = require_http();
+    function episodeUrl(slug, ep) {
+      return SITE + "/sever2/" + slug + "/tap-" + ep;
+    }
+    function is404(html) {
+      return /404 Not Found/i.test((html || "").slice(0, 300));
+    }
+    function parseEpisodeList(html) {
+      const nums = {};
+      const re = /\/sever2\/[^"']*\/tap-(\d+)"/g;
+      let m;
+      while (m = re.exec(html)) nums[parseInt(m[1], 10)] = true;
+      return Object.keys(nums).map(Number).sort((a, b) => a - b);
+    }
+    function resolveEpisode2(slug, seasonNum, episodeNum) {
+      return __async(this, null, function* () {
+        const ep = episodeNum || 1;
+        const label = "S" + pad2(seasonNum || 1) + "E" + pad2(ep);
+        let html = yield safeGet(episodeUrl(slug, ep));
+        if (html && !is404(html)) {
+          return { html, epLabel: label, ep };
+        }
+        const listHtml = yield safeGet(episodeUrl(slug, 1));
+        if (!listHtml || is404(listHtml)) return null;
+        let eps = cache.get("episodes:" + slug);
+        if (eps === void 0) {
+          eps = parseEpisodeList(listHtml);
+          cache.set("episodes:" + slug, eps, C.TTL.episodes);
+        }
+        if (eps.indexOf(ep) !== -1) {
+          html = yield safeGet(episodeUrl(slug, ep));
+          if (html && !is404(html)) return { html, epLabel: label, ep };
+        }
+        if (eps.length && ep > eps[eps.length - 1]) {
+          console.log("[yanhh3d] ep " + ep + " > max " + eps[eps.length - 1] + " for " + slug + " (season split?)");
+        }
+        return null;
+      });
+    }
+    function pad2(n) {
+      n = Number(n) || 0;
+      return n < 10 ? "0" + n : "" + n;
+    }
+    function safeGet(url) {
+      return __async(this, null, function* () {
+        try {
+          return yield getText(url, { headers: siteHeaders() }, 8e3);
+        } catch (e) {
+          return null;
+        }
+      });
+    }
+    module2.exports = { resolveEpisode: resolveEpisode2, episodeUrl, parseEpisodeList };
+  }
+});
+
+// src/yanhh3d/hls.js
+var require_hls = __commonJS({
+  "src/yanhh3d/hls.js"(exports2, module2) {
+    "use strict";
+    function isMaster(text) {
+      return /#EXT-X-STREAM-INF/i.test(text || "");
+    }
+    function qualityFromHeight(h) {
+      if (!h) return "Auto";
+      if (h >= 2e3) return "2160p";
+      if (h >= 1400) return "1080p";
+      if (h >= 1e3) return "1080p";
+      if (h >= 700) return "720p";
+      if (h >= 450) return "480p";
+      if (h >= 300) return "360p";
+      return "240p";
+    }
+    function absolutize(uri, baseUrl) {
+      try {
+        return new URL(uri, baseUrl).href;
+      } catch (e) {
+        return uri;
+      }
+    }
+    function parseMaster(text, baseUrl) {
+      const lines = String(text).split(/\r?\n/);
+      const out = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!/^#EXT-X-STREAM-INF/i.test(line)) continue;
+        const res = line.match(/RESOLUTION=(\d+)x(\d+)/i);
+        const bw = line.match(/BANDWIDTH=(\d+)/i);
+        let uri = "";
+        for (let j = i + 1; j < lines.length; j++) {
+          const l = lines[j].trim();
+          if (l && l[0] !== "#") {
+            uri = l;
+            break;
+          }
+        }
+        if (!uri) continue;
+        const height = res ? parseInt(res[2], 10) : 0;
+        out.push({
+          url: absolutize(uri, baseUrl),
+          quality: qualityFromHeight(height),
+          height,
+          bandwidth: bw ? parseInt(bw[1], 10) : 0
+        });
+      }
+      out.sort((a, b) => b.height - a.height || b.bandwidth - a.bandwidth);
+      return out;
+    }
+    module2.exports = { isMaster, parseMaster, qualityFromHeight };
+  }
+});
+
+// src/yanhh3d/extractor.js
+var require_extractor = __commonJS({
+  "src/yanhh3d/extractor.js"(exports2, module2) {
+    "use strict";
+    var { USER_AGENT } = require_constants();
+    var { fetchWithTimeout, getText, siteHeaders } = require_http();
+    var { qualityFromHeight } = require_hls();
+    var DM_REF = "https://www.dailymotion.com/";
+    function parsePlayerOptions(html) {
+      const re = /name="(LINK\d+)"[^>]*data-src="([^"]+)"/g;
+      const out = [];
+      let m;
+      while (m = re.exec(html)) out.push({ name: m[1], url: m[2] });
+      return out;
+    }
+    function classify(url) {
+      if (/dailymotion\.com/i.test(url)) return "dailymotion";
+      if (/fbcdn\.cloud/i.test(url)) return "fbcdn";
+      if (/streamc\.xyz/i.test(url)) return "streamc";
+      if (/abysscdn\.com/i.test(url)) return "abyss";
+      return "unknown";
+    }
+    function resolveDailymotion(embedUrl) {
+      return __async(this, null, function* () {
+        const idM = embedUrl.match(/video\/([a-zA-Z0-9]+)/);
+        if (!idM) return null;
+        let meta;
+        try {
+          const res = yield fetchWithTimeout(
+            "https://www.dailymotion.com/player/metadata/video/" + idM[1],
+            { headers: { "User-Agent": USER_AGENT, Referer: DM_REF } },
+            6e3
+          );
+          meta = yield res.json();
+        } catch (e) {
+          return null;
+        }
+        if (!meta || meta.error) return null;
+        const q = meta.qualities || {};
+        const entries = [];
+        for (const key of Object.keys(q)) {
+          if (key === "auto") continue;
+          const url = q[key] && q[key][0] && q[key][0].url;
+          const h = parseInt(key, 10);
+          if (url && h) entries.push({ url, quality: qualityFromHeight(h), height: h });
+        }
+        entries.sort((a, b) => b.height - a.height);
+        if (!entries.length) {
+          const auto = q.auto && q.auto[0] && q.auto[0].url;
+          if (auto) entries.push({ url: auto, quality: "Auto", height: 0 });
+        }
+        if (!entries.length) return null;
+        return { entries, referer: DM_REF, kind: "clean" };
+      });
+    }
+    function resolveFbcdn(playerUrl) {
+      return __async(this, null, function* () {
+        let html;
+        try {
+          html = yield getText(playerUrl, { headers: siteHeaders() }, 6e3);
+        } catch (e) {
+          return null;
+        }
+        const single = (url) => ({ entries: [{ url, quality: "Auto", height: 0 }], referer: "https://yanhh3d.pw/", kind: "polyglot" });
+        const su = html.match(/data-stream-url="([^"]+)"/);
+        if (su) return single(su[1]);
+        const obf = html.match(/data-obf="([^"]+)"/);
+        if (obf) {
+          try {
+            const j = JSON.parse(decodeBase64(obf[1]));
+            if (j && j.pU) return single(j.pU);
+          } catch (e) {
+          }
+        }
+        return null;
+      });
+    }
+    function decodeBase64(s) {
+      if (typeof atob === "function") {
+        const bin = atob(s);
+        return bin;
+      }
+      return Buffer.from(s, "base64").toString("utf8");
+    }
+    function expandToStreams(resolved, ctx) {
+      const headers = {
+        "User-Agent": USER_AGENT,
+        Referer: resolved.referer,
+        Origin: resolved.referer.replace(/\/$/, "")
+      };
+      return resolved.entries.map((e) => makeStream(ctx, e.url, e.quality, headers));
+    }
+    function makeStream(ctx, url, quality, headers) {
+      const tag = ctx.kind === "clean" ? "HLS" : "HLS*";
+      return {
+        name: "YanHH3D " + quality,
+        title: ctx.epLabel + " \u2022 Vietsub \u2022 " + tag + (ctx.server ? " \u2022 " + ctx.server : ""),
+        url,
+        quality,
+        format: /\.mp4($|\?)/i.test(url) ? "mp4" : "m3u8",
+        provider: "yanhh3d",
+        headers
+      };
+    }
+    function extractStreams2(watchHtml, epLabel) {
+      return __async(this, null, function* () {
+        const opts = parsePlayerOptions(watchHtml);
+        if (!opts.length) return [];
+        const byHost = { dailymotion: [], fbcdn: [], other: [] };
+        for (const o of opts) {
+          const h = classify(o.url);
+          if (h === "dailymotion") byHost.dailymotion.push(o);
+          else if (h === "fbcdn") byHost.fbcdn.push(o);
+          else byHost.other.push(o);
+        }
+        for (const o of byHost.dailymotion) {
+          const r = yield resolveDailymotion(o.url);
+          if (r) {
+            const streams = expandToStreams(r, { epLabel, kind: r.kind, server: "Dailymotion" });
+            if (streams.length) return streams;
+          }
+        }
+        for (const o of byHost.fbcdn) {
+          const r = yield resolveFbcdn(o.url);
+          if (r) {
+            const streams = expandToStreams(r, { epLabel, kind: r.kind, server: "fbcdn" });
+            if (streams.length) return streams;
+          }
+        }
+        return [];
+      });
+    }
+    module2.exports = { extractStreams: extractStreams2, parsePlayerOptions, resolveDailymotion, resolveFbcdn, classify };
+  }
+});
+
 // src/yanhh3d/index.js
 var { findSlug } = require_search();
+var { resolveEpisode } = require_detail();
+var { extractStreams } = require_extractor();
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   return __async(this, null, function* () {
     try {
       if (mediaType !== "tv") return [];
       const slug = yield findSlug(tmdbId, seasonNum);
       if (!slug) return [];
-      return [];
+      const ep = yield resolveEpisode(slug, seasonNum, episodeNum);
+      if (!ep) return [];
+      const streams = yield extractStreams(ep.html, ep.epLabel);
+      return Array.isArray(streams) ? streams : [];
     } catch (e) {
       console.log("[yanhh3d] getStreams error:", e && e.message ? e.message : e);
       return [];
