@@ -303,7 +303,7 @@ async function handleMeta(type, fullId, origin) {
     title: 'Tập ' + (e.ep || e.token.replace('tap-', '')),
     season: 1,
     episode: e.ep || 1,
-    released: undefined,
+    thumbnail: posterUrl, // else Nuvio shows black episode cards
   }));
 
   const meta = {
